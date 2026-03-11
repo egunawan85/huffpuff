@@ -2,43 +2,134 @@
 set -euo pipefail
 
 APP_DIR="/root/huffpuff"
-SERVICE_NAME="huffpuff"
-SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-NODE_BIN="$(which node)"
+GATEWAY_APP="huffpuff-gateway"
+WORKSPACES_APP="huffpuff-workspaces"
+REGION="sjc"
+DOMAIN="thehuffandpuff.com"
 
-echo "==> Installing dependencies..."
 cd "$APP_DIR"
-npm install --production
 
-echo "==> Creating systemd service..."
-cat > "$SERVICE_FILE" <<EOF
-[Unit]
-Description=Huffpuff Workspace (Express + ttyd)
-After=network.target
+# Load .env for secrets
+if [ -f .env ]; then
+  set -a
+  source .env
+  set +a
+fi
 
-[Service]
-Type=simple
-WorkingDirectory=${APP_DIR}
-ExecStart=${NODE_BIN} server.js
-Restart=on-failure
-RestartSec=3
-Environment=NODE_ENV=production
-EnvironmentFile=-${APP_DIR}/.env
+# ── 1. Install flyctl if missing ─────────────────────────────────────
+export FLYCTL_INSTALL="$HOME/.fly"
+export PATH="$FLYCTL_INSTALL/bin:$PATH"
 
-[Install]
-WantedBy=multi-user.target
-EOF
+if ! command -v flyctl &>/dev/null; then
+  echo "==> Installing flyctl..."
+  curl -L https://fly.io/install.sh | sh
+fi
 
-echo "==> Reloading systemd and (re)starting service..."
-systemctl daemon-reload
-systemctl enable "$SERVICE_NAME"
-systemctl restart "$SERVICE_NAME"
+# Check auth
+if ! flyctl auth whoami &>/dev/null; then
+  echo "==> Not logged in to Fly.io. Authenticating..."
+  echo "    A browser link will appear — open it to log in."
+  echo ""
+  flyctl auth login
+fi
 
-echo "==> Service status:"
-systemctl status "$SERVICE_NAME" --no-pager
-
+echo "==> Logged in as: $(flyctl auth whoami)"
 echo ""
-echo "Done! Huffpuff is running as a systemd service."
-echo "  Logs:    journalctl -u ${SERVICE_NAME} -f"
-echo "  Restart: systemctl restart ${SERVICE_NAME}"
-echo "  Stop:    systemctl stop ${SERVICE_NAME}"
+
+# ── 2. Create Fly apps (idempotent) ──────────────────────────────────
+for app in "$GATEWAY_APP" "$WORKSPACES_APP"; do
+  if flyctl apps list --json | grep -q "\"$app\""; then
+    echo "==> App '$app' already exists"
+  else
+    echo "==> Creating app '$app' in region $REGION..."
+    flyctl apps create "$app" --org personal
+  fi
+done
+echo ""
+
+# ── 3. Build and push workspace container image ──────────────────────
+echo "==> Building workspace container image..."
+cd docker
+BUILD_OUTPUT=$(flyctl deploy --app "$WORKSPACES_APP" --dockerfile Dockerfile --build-only --push --remote-only 2>&1)
+echo "$BUILD_OUTPUT"
+# Extract the image reference (with sha256 digest) from the build output
+FLY_WS_IMAGE=$(echo "$BUILD_OUTPUT" | grep -o 'registry.fly.io/'"$WORKSPACES_APP"'[^ ]*@sha256:[a-f0-9]*' | head -1)
+if [ -z "$FLY_WS_IMAGE" ]; then
+  echo "WARNING: Could not extract image digest, falling back to :latest tag"
+  FLY_WS_IMAGE="registry.fly.io/$WORKSPACES_APP:latest"
+fi
+cd "$APP_DIR"
+echo "    Image: $FLY_WS_IMAGE"
+echo ""
+
+# ── 4. Set gateway secrets ────────────────────────────────────────────
+echo "==> Setting gateway secrets..."
+
+# Get a Fly API token for machine management (needs org-level access to create machines/volumes)
+FLY_API_TOKEN="${FLY_API_TOKEN:-}"
+if [ -z "$FLY_API_TOKEN" ]; then
+  echo "    Generating Fly API token (org-level for machine management)..."
+  FLY_API_TOKEN=$(flyctl tokens create org --org personal -x 999999h 2>/dev/null || flyctl auth token)
+fi
+
+flyctl secrets set --app "$GATEWAY_APP" --stage \
+  GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID}" \
+  GOOGLE_CLIENT_SECRET="${GOOGLE_CLIENT_SECRET}" \
+  CALLBACK_URL="${CALLBACK_URL:-https://$DOMAIN/auth/google/callback}" \
+  SESSION_SECRET="${SESSION_SECRET:-$(openssl rand -hex 32)}" \
+  FLY_API_TOKEN="$FLY_API_TOKEN" \
+  FLY_APP_NAME="$WORKSPACES_APP" \
+  FLY_IMAGE="$FLY_WS_IMAGE" \
+  FLY_REGION="$REGION" \
+  IDLE_TIMEOUT_MINUTES="${IDLE_TIMEOUT_MINUTES:-30}" \
+  COOKIE_SECURE="true"
+
+echo "    Secrets staged."
+echo ""
+
+# ── 5. Deploy gateway ────────────────────────────────────────────────
+echo "==> Deploying gateway..."
+flyctl deploy --app "$GATEWAY_APP" --remote-only
+echo ""
+
+# ── 6. Set up custom domain (if not already) ─────────────────────────
+if ! flyctl certs list --app "$GATEWAY_APP" --json 2>/dev/null | grep -q "$DOMAIN"; then
+  echo "==> Adding custom domain $DOMAIN..."
+  flyctl certs create --app "$GATEWAY_APP" "$DOMAIN" || true
+  echo ""
+  echo "    !! Point your DNS for $DOMAIN to the Fly.io app:"
+  echo "    CNAME $DOMAIN -> $GATEWAY_APP.fly.dev"
+  echo "    (or use an A record — run 'flyctl ips list --app $GATEWAY_APP' for the IP)"
+  echo ""
+else
+  echo "==> Custom domain $DOMAIN already configured"
+fi
+echo ""
+
+# ── 7. Allocate shared IPv4 if needed ─────────────────────────────────
+if ! flyctl ips list --app "$GATEWAY_APP" --json 2>/dev/null | grep -q '"v4"'; then
+  echo "==> Allocating shared IPv4..."
+  flyctl ips allocate-v4 --shared --app "$GATEWAY_APP" || true
+fi
+echo ""
+
+# ── Done ──────────────────────────────────────────────────────────────
+GATEWAY_URL=$(flyctl ips list --app "$GATEWAY_APP" --json 2>/dev/null | grep -o '"address":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+echo "============================================"
+echo " Huffpuff deployed!"
+echo "============================================"
+echo ""
+echo "  Gateway:      https://$GATEWAY_APP.fly.dev"
+echo "  Custom domain: https://$DOMAIN"
+echo "  Dashboard:    https://fly.io/apps/$GATEWAY_APP"
+echo ""
+echo "  Logs:         flyctl logs --app $GATEWAY_APP"
+echo "  Workspace logs: flyctl logs --app $WORKSPACES_APP"
+echo "  Restart:      flyctl machines restart --app $GATEWAY_APP"
+echo ""
+echo "  DNS: Point $DOMAIN CNAME -> $GATEWAY_APP.fly.dev"
+if [ -n "${GATEWAY_URL:-}" ]; then
+  echo "  (or A record -> $GATEWAY_URL)"
+fi
+echo ""

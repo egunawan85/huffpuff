@@ -1,4 +1,4 @@
-// Check auth and load user info
+// Load user info (served by gateway, proxied through)
 fetch('/api/me')
   .then(r => {
     if (!r.ok) { window.location.href = '/login.html'; return null; }
@@ -12,12 +12,8 @@ fetch('/api/me')
     }
   });
 
-// Load config and set ttyd iframe src
-fetch('/api/config')
-  .then(r => r.json())
-  .then(config => {
-    document.getElementById('terminal').src = location.origin + '/ttyd/';
-  });
+// Set ttyd iframe src (proxied through gateway -> container -> ttyd)
+document.getElementById('terminal').src = location.origin + '/ttyd/';
 
 // Resizable divider
 (function () {

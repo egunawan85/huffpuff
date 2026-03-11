@@ -1,0 +1,5 @@
+app = "huffpuff-workspaces"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"

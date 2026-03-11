@@ -1,0 +1,13 @@
+{
+  "name": "huffpuff-workspace",
+  "version": "1.0.0",
+  "description": "Per-user workspace container (ttyd + file browser)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "http-proxy-middleware": "^3.0.0"
+  }
+}
