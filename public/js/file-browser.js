@@ -1,6 +1,7 @@
 // File browser state
 let selectedEntry = null;
 const selectedEntries = new Set();
+let lastClickedRow = null;
 let ctxTarget = null;
 let currentViewerPath = null;
 const expandedPaths = new Set();
@@ -137,9 +138,10 @@ function setupDrag(row, entryPath, isDir) {
       e.preventDefault();
       row.classList.remove('drag-over');
 
-      // External file upload
-      if (e.dataTransfer.files && e.dataTransfer.files.length > 0 && !dragSrcPath) {
-        await handleFileDrop(e.dataTransfer.files, entryPath);
+      // External file/directory upload
+      if (e.dataTransfer.items && e.dataTransfer.items.length > 0 && !dragSrcPath) {
+        const entries = extractEntries(e.dataTransfer.items);
+        if (entries.length) await handleFileDrop(entries, entryPath);
         return;
       }
 
@@ -165,27 +167,91 @@ function setupDrag(row, entryPath, isDir) {
   }
 }
 
-async function handleFileDrop(files, destDir) {
-  showUploadLoader(`Uploading ${files.length} file(s)...`);
+// Recursively read all files from a dropped directory entry
+function readEntryFiles(entry, basePath) {
+  return new Promise((resolve) => {
+    if (entry.isFile) {
+      entry.file(f => {
+        f._relativePath = basePath + f.name;
+        resolve([f]);
+      }, () => resolve([]));
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      const allEntries = [];
+      // readEntries may return partial results, so read until empty
+      function readBatch() {
+        reader.readEntries(entries => {
+          if (entries.length === 0) {
+            Promise.all(allEntries.map(e => readEntryFiles(e, basePath + entry.name + '/')))
+              .then(results => resolve(results.flat()));
+          } else {
+            allEntries.push(...entries);
+            readBatch();
+          }
+        }, () => resolve([]));
+      }
+      readBatch();
+    } else {
+      resolve([]);
+    }
+  });
+}
+
+let uploadAbortController = null;
+
+// Extract entries synchronously before dataTransfer is cleared
+function extractEntries(dataTransferItems) {
+  const entries = [];
+  for (const item of dataTransferItems) {
+    const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
+    if (entry) entries.push(entry);
+  }
+  return entries;
+}
+
+async function handleFileDrop(entries, destDir) {
+  showUploadLoader('Scanning files...');
+
+  let files = [];
+  for (const entry of entries) {
+    if (uploadCancelled) break;
+    const found = await readEntryFiles(entry, '');
+    files.push(...found);
+  }
+
+  if (uploadCancelled || files.length === 0) {
+    hideUploadLoader();
+    return;
+  }
+
+  uploadAbortController = new AbortController();
+  showUploadLoader(`Uploading 0/${files.length} file(s)...`);
   let uploaded = 0;
 
   for (const file of files) {
-    if (uploadCancelled) break;
-    updateUploadLoader(`Uploading ${file.name} (${++uploaded}/${files.length})...`);
+    if (uploadCancelled) {
+      uploadAbortController.abort();
+      break;
+    }
+    updateUploadLoader(`Uploading ${++uploaded} of ${files.length}...`);
 
     try {
       const buf = await file.arrayBuffer();
       await fetch(
-        API_BASE + '/upload?dir=' + encodeURIComponent(destDir) + '&name=' + encodeURIComponent(file.name),
-        { method: 'POST', body: buf }
+        API_BASE + '/upload?dir=' + encodeURIComponent(destDir) + '&name=' + encodeURIComponent(file._relativePath || file.name),
+        { method: 'POST', body: buf, signal: uploadAbortController.signal }
       );
     } catch (err) {
+      if (err.name === 'AbortError') break;
       toast('Upload failed: ' + err.message);
     }
   }
 
+  const wasCancelled = uploadCancelled;
+  uploadAbortController = null;
   hideUploadLoader();
-  if (!uploadCancelled) toast(`Uploaded ${uploaded} file(s)`);
+  if (wasCancelled) toast(`Upload cancelled (${uploaded - 1} of ${files.length})`);
+  else toast(`Uploaded ${uploaded} file(s)`);
   refresh();
 }
 
@@ -200,9 +266,18 @@ tree.addEventListener('dragover', (e) => {
 });
 
 tree.addEventListener('drop', async (e) => {
-  if (e.dataTransfer.files && e.dataTransfer.files.length > 0 && !dragSrcPath) {
+  if (e.dataTransfer.items && e.dataTransfer.items.length > 0 && !dragSrcPath) {
     e.preventDefault();
-    await handleFileDrop(e.dataTransfer.files, ROOT);
+    const entries = extractEntries(e.dataTransfer.items);
+    if (entries.length) await handleFileDrop(entries, ROOT);
+  }
+});
+
+// Click on tree background clears selection
+tree.addEventListener('click', (e) => {
+  if (e.target === tree) {
+    clearSelection();
+    lastClickedRow = null;
   }
 });
 
@@ -239,14 +314,30 @@ async function loadTree(dir, container, depth) {
       row.appendChild(icon);
       row.appendChild(name);
 
-      // Click handler
+      // Click handler — single click selects, supports multi-select
       row.addEventListener('click', (e) => {
         e.stopPropagation();
-        selectEntry(row);
 
-        if (entry.isDir) {
-          toggleDir(entry.path, row, chevron, icon, depth);
+        if (e.ctrlKey || e.metaKey) {
+          // Toggle individual selection
+          toggleSelectEntry(row);
+        } else if (e.shiftKey && lastClickedRow) {
+          // Range select
+          rangeSelect(lastClickedRow, row);
         } else {
+          // Normal click — select only this entry, expand/collapse dirs
+          selectEntry(row);
+          if (entry.isDir) {
+            toggleDir(entry.path, row, chevron, icon, depth);
+          }
+        }
+        lastClickedRow = row;
+      });
+
+      // Double-click to open files
+      row.addEventListener('dblclick', (e) => {
+        e.stopPropagation();
+        if (!entry.isDir) {
           openFile(entry.path, entry.name);
         }
       });
@@ -255,7 +346,10 @@ async function loadTree(dir, container, depth) {
       row.addEventListener('contextmenu', (e) => {
         e.preventDefault();
         e.stopPropagation();
-        selectEntry(row);
+        // If right-clicked row is not in current selection, select just it
+        if (!row.classList.contains('selected')) {
+          selectEntry(row);
+        }
         ctxTarget = entry;
         showContextMenu(e.clientX, e.clientY);
       });
@@ -305,10 +399,46 @@ function toggleDir(dirPath, row, chevron, icon, depth) {
   }
 }
 
+function clearSelection() {
+  selectedEntries.forEach(r => r.classList.remove('selected'));
+  selectedEntries.clear();
+  selectedEntry = null;
+}
+
 function selectEntry(row) {
-  if (selectedEntry) selectedEntry.classList.remove('selected');
+  clearSelection();
   row.classList.add('selected');
   selectedEntry = row;
+  selectedEntries.add(row);
+}
+
+function toggleSelectEntry(row) {
+  if (selectedEntries.has(row)) {
+    row.classList.remove('selected');
+    selectedEntries.delete(row);
+    selectedEntry = selectedEntries.size > 0 ? [...selectedEntries].pop() : null;
+  } else {
+    row.classList.add('selected');
+    selectedEntries.add(row);
+    selectedEntry = row;
+  }
+}
+
+function rangeSelect(fromRow, toRow) {
+  const allRows = [...document.querySelectorAll('.entry')];
+  const fromIdx = allRows.indexOf(fromRow);
+  const toIdx = allRows.indexOf(toRow);
+  if (fromIdx === -1 || toIdx === -1) return;
+
+  const start = Math.min(fromIdx, toIdx);
+  const end = Math.max(fromIdx, toIdx);
+
+  clearSelection();
+  for (let i = start; i <= end; i++) {
+    allRows[i].classList.add('selected');
+    selectedEntries.add(allRows[i]);
+  }
+  selectedEntry = toRow;
 }
 
 // --- File viewer ---
@@ -366,21 +496,22 @@ function hideContextMenu() {
 
 document.addEventListener('click', hideContextMenu);
 
-document.querySelectorAll('.ctx-item').forEach(item => {
+document.querySelectorAll('#ctx-menu .ctx-item').forEach(item => {
   item.addEventListener('click', async (e) => {
     e.stopPropagation();
     const action = item.dataset.action;
+    const target = ctxTarget;
     hideContextMenu();
-    if (!ctxTarget && action !== 'new-file' && action !== 'new-folder') return;
+    if (!target && action !== 'new-file' && action !== 'new-folder') return;
 
     switch (action) {
       case 'open':
-        if (!ctxTarget.isDir) openFile(ctxTarget.path, ctxTarget.name);
+        if (!target.isDir) openFile(target.path, target.name);
         break;
 
       case 'download':
-        if (!ctxTarget.isDir) {
-          window.open(API_BASE + '/download?file=' + encodeURIComponent(ctxTarget.path));
+        if (!target.isDir) {
+          window.open(API_BASE + '/download?file=' + encodeURIComponent(target.path));
         }
         break;
 
@@ -393,18 +524,18 @@ document.querySelectorAll('.ctx-item').forEach(item => {
         break;
 
       case 'rename':
-        startRename(ctxTarget);
+        startRename(target);
         break;
 
       case 'delete':
-        if (confirm('Delete "' + ctxTarget.name + '"?')) {
-          await fetch(API_BASE + '/delete', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ targetPath: ctxTarget.path }),
-          });
-          toast('Deleted');
-          refresh();
+        if (selectedEntries.size > 1) {
+          const paths = [...selectedEntries].map(r => ({
+            path: r.dataset.path,
+            name: r.querySelector('.name').textContent,
+          }));
+          confirmDeleteMultiple(paths);
+        } else {
+          confirmDelete(target);
         }
         break;
     }
@@ -413,26 +544,146 @@ document.querySelectorAll('.ctx-item').forEach(item => {
 
 // --- Create new file/folder ---
 function createNew(isDir) {
-  const name = prompt(isDir ? 'New folder name:' : 'New file name:');
-  if (!name) return;
+  const parentDoc = window.parent.document;
+  const modal = parentDoc.getElementById('create-modal');
+  const title = parentDoc.getElementById('create-modal-title');
+  const input = parentDoc.getElementById('create-modal-input');
+  const confirmBtn = parentDoc.getElementById('create-modal-confirm');
+  const cancelBtn = parentDoc.getElementById('create-modal-cancel');
 
-  // Use selected dir or root
-  let parentDir = ROOT;
-  if (selectedEntry) {
-    parentDir = selectedEntry.dataset.isDir === 'true'
-      ? selectedEntry.dataset.path
-      : selectedEntry.dataset.path.substring(0, selectedEntry.dataset.path.lastIndexOf('/'));
+  title.textContent = isDir ? 'New Folder' : 'New File';
+  input.placeholder = isDir ? 'Folder name...' : 'File name...';
+  input.value = '';
+  modal.classList.add('open');
+  setTimeout(() => input.focus(), 50);
+
+  function cleanup() {
+    modal.classList.remove('open');
+    confirmBtn.removeEventListener('click', onConfirm);
+    cancelBtn.removeEventListener('click', onCancel);
+    input.removeEventListener('keydown', onKey);
+    modal.removeEventListener('click', onBackdrop);
   }
 
-  fetch(API_BASE + '/create', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ parentDir, name, isDir }),
-  })
-    .then(r => {
-      if (r.ok) { toast('Created ' + name); refresh(); }
-      else r.text().then(t => toast('Error: ' + t));
-    });
+  function submit() {
+    const name = input.value.trim();
+    if (!name) return;
+    cleanup();
+
+    let parentDir = ROOT;
+    if (selectedEntry) {
+      parentDir = selectedEntry.dataset.isDir === 'true'
+        ? selectedEntry.dataset.path
+        : selectedEntry.dataset.path.substring(0, selectedEntry.dataset.path.lastIndexOf('/'));
+    }
+
+    fetch(API_BASE + '/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ parentDir, name, isDir }),
+    })
+      .then(r => {
+        if (r.ok) { toast('Created ' + name); refresh(); }
+        else r.text().then(t => toast('Error: ' + t));
+      });
+  }
+
+  function onConfirm() { submit(); }
+  function onCancel() { cleanup(); }
+  function onKey(e) {
+    if (e.key === 'Enter') submit();
+    if (e.key === 'Escape') cleanup();
+  }
+  function onBackdrop(e) { if (e.target === modal) cleanup(); }
+
+  confirmBtn.addEventListener('click', onConfirm);
+  cancelBtn.addEventListener('click', onCancel);
+  input.addEventListener('keydown', onKey);
+  modal.addEventListener('click', onBackdrop);
+}
+
+// --- Confirm delete ---
+function confirmDelete(entry) {
+  const parentDoc = window.parent.document;
+  const modal = parentDoc.getElementById('delete-modal');
+  const msg = parentDoc.getElementById('delete-modal-msg');
+  const confirmBtn = parentDoc.getElementById('delete-modal-confirm');
+  const cancelBtn = parentDoc.getElementById('delete-modal-cancel');
+
+  msg.textContent = `Delete "${entry.name}"?`;
+  modal.classList.add('open');
+
+  function cleanup() {
+    modal.classList.remove('open');
+    confirmBtn.removeEventListener('click', onConfirm);
+    cancelBtn.removeEventListener('click', onCancel);
+    window.parent.document.removeEventListener('keydown', onKey);
+    modal.removeEventListener('click', onBackdrop);
+  }
+
+  function onConfirm() {
+    cleanup();
+    fetch(API_BASE + '/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ targetPath: entry.path }),
+    }).then(() => { toast('Deleted'); refresh(); });
+  }
+
+  function onCancel() { cleanup(); }
+  function onKey(e) {
+    if (e.key === 'Enter') onConfirm();
+    if (e.key === 'Escape') cleanup();
+  }
+  function onBackdrop(e) { if (e.target === modal) cleanup(); }
+
+  confirmBtn.addEventListener('click', onConfirm);
+  cancelBtn.addEventListener('click', onCancel);
+  window.parent.document.addEventListener('keydown', onKey);
+  modal.addEventListener('click', onBackdrop);
+}
+
+// --- Confirm delete multiple ---
+function confirmDeleteMultiple(items) {
+  const parentDoc = window.parent.document;
+  const modal = parentDoc.getElementById('delete-modal');
+  const msg = parentDoc.getElementById('delete-modal-msg');
+  const confirmBtn = parentDoc.getElementById('delete-modal-confirm');
+  const cancelBtn = parentDoc.getElementById('delete-modal-cancel');
+
+  msg.textContent = `Delete ${items.length} items?`;
+  modal.classList.add('open');
+
+  function cleanup() {
+    modal.classList.remove('open');
+    confirmBtn.removeEventListener('click', onConfirm);
+    cancelBtn.removeEventListener('click', onCancel);
+    window.parent.document.removeEventListener('keydown', onKey);
+    modal.removeEventListener('click', onBackdrop);
+  }
+
+  function onConfirm() {
+    cleanup();
+    Promise.all(items.map(item =>
+      fetch(API_BASE + '/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ targetPath: item.path }),
+      })
+    )).then(() => { toast(`Deleted ${items.length} items`); refresh(); });
+  }
+
+  function onCancel() { cleanup(); }
+  function onKey(e) {
+    if (e.key === 'Enter') onConfirm();
+    if (e.key === 'Escape') cleanup();
+  }
+  function onBackdrop(e) { if (e.target === modal) cleanup(); }
+
+  confirmBtn.addEventListener('click', onConfirm);
+  cancelBtn.addEventListener('click', onCancel);
+  window.parent.document.addEventListener('keydown', onKey);
+  modal.addEventListener('click', onBackdrop);
 }
 
 // --- Rename ---
@@ -479,6 +730,40 @@ function startRename(entry) {
 function refresh() {
   loadTree(ROOT, document.getElementById('tree'), 0);
 }
+
+// --- Background context menu (right-click on empty space) ---
+tree.addEventListener('contextmenu', (e) => {
+  // Only trigger if clicking the tree background, not a file entry
+  if (e.target === tree || e.target.closest('.entry') === null) {
+    e.preventDefault();
+    ctxTarget = null;
+    if (selectedEntry) { selectedEntry.classList.remove('selected'); selectedEntry = null; }
+    showBackgroundContextMenu(e.clientX, e.clientY);
+  }
+});
+
+function showBackgroundContextMenu(x, y) {
+  const menu = document.getElementById('bg-ctx-menu');
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+  menu.classList.add('open');
+}
+
+function hideBackgroundContextMenu() {
+  document.getElementById('bg-ctx-menu').classList.remove('open');
+}
+
+document.addEventListener('click', hideBackgroundContextMenu);
+
+document.querySelectorAll('#bg-ctx-menu .ctx-item').forEach(item => {
+  item.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const action = item.dataset.action;
+    hideBackgroundContextMenu();
+    if (action === 'new-file') createNew(false);
+    if (action === 'new-folder') createNew(true);
+  });
+});
 
 // --- SSE file watching ---
 function connectSSE() {

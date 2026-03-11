@@ -160,14 +160,15 @@ function createFilesRouter(filesRoot) {
     if (!destDir) return res.status(403).json({ error: 'Forbidden' });
 
     const filename = decodeURIComponent(req.query.name || 'upload');
-    let destPath = path.join(destDir, path.basename(filename));
+    let destPath = path.join(destDir, filename);
     if (!safePath(destPath)) return res.status(403).json({ error: 'Forbidden' });
 
     const chunks = [];
     req.on('data', c => chunks.push(c));
     req.on('end', () => {
       try {
-        fs.mkdirSync(destDir, { recursive: true });
+        // Ensure parent directory exists (supports nested paths like dir/subdir/file.txt)
+        fs.mkdirSync(path.dirname(destPath), { recursive: true });
 
         // Auto-rename duplicates: file.txt -> file (1).txt
         if (fs.existsSync(destPath)) {

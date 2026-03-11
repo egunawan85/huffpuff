@@ -6,7 +6,7 @@ const { createFilesRouter } = require('./src/routes/files');
 const PORT = process.env.PORT || 3000;
 const TTYD_PORT = process.env.TTYD_PORT || 7681;
 const TTYD_CMD = process.env.TTYD_CMD || 'claude';
-const FILES_ROOT = process.env.FILES_ROOT || '/root/product-plan/egunawan85';
+const FILES_ROOT = process.env.FILES_ROOT || '/root/egunawan85';
 
 const app = express();
 
@@ -27,11 +27,15 @@ app.get('/api/config', (req, res) => {
 // Start ttyd as a child process
 function startTtyd() {
   const ttydBin = process.env.TTYD_BIN || 'ttyd';
+  // Allow nested Claude sessions when spawning claude inside ttyd
+  const env = { ...process.env };
+  delete env.CLAUDE_CONTEXT;
+
   const ttyd = spawn(ttydBin, [
     '--port', String(TTYD_PORT),
     '--writable',
     TTYD_CMD,
-  ], { stdio: 'inherit' });
+  ], { stdio: 'inherit', cwd: FILES_ROOT, env });
 
   ttyd.on('error', (err) => {
     console.error(`Failed to start ttyd: ${err.message}`);

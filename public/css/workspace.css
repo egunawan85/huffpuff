@@ -52,3 +52,91 @@ iframe {
 .iframe-cover.active {
   display: block;
 }
+
+/* Modals */
+.modal-overlay {
+  display: none;
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 2000;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal-overlay.open { display: flex; }
+
+.modal {
+  background: #33363a;
+  border: 1px solid #4a4d52;
+  border-radius: 10px;
+  padding: 20px 24px;
+  width: 320px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+
+.modal-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #e0e0e0;
+  margin-bottom: 14px;
+}
+
+.modal-message {
+  font-size: 13px;
+  color: #9a9c9e;
+  margin-bottom: 16px;
+  line-height: 1.5;
+}
+
+.modal-input {
+  width: 100%;
+  background: #1e2124;
+  border: 1px solid #4a4d52;
+  color: #e0e0e0;
+  font-size: 14px;
+  font-family: inherit;
+  padding: 8px 10px;
+  border-radius: 6px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.modal-input:focus { border-color: #5294e2; }
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.modal-btn {
+  border: none;
+  padding: 6px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.modal-btn.cancel {
+  background: rgba(255, 255, 255, 0.08);
+  color: #9a9c9e;
+}
+
+.modal-btn.cancel:hover { background: rgba(255, 255, 255, 0.14); }
+
+.modal-btn.confirm {
+  background: #5294e2;
+  color: #fff;
+}
+
+.modal-btn.confirm:hover { background: #4a88d2; }
+
+.modal-btn.danger {
+  background: #e06c75;
+  color: #fff;
+}
+
+.modal-btn.danger:hover { background: #d05a63; }
