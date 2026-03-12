@@ -9,8 +9,8 @@ const db = require('../db');
 
 const FLY_API_URL = process.env.FLY_API_URL || 'https://api.machines.dev';
 const FLY_API_TOKEN = process.env.FLY_API_TOKEN;
-const FLY_APP_NAME = process.env.FLY_APP_NAME || 'huffpuff-workspaces';
-const FLY_IMAGE = process.env.FLY_IMAGE || 'registry.fly.io/huffpuff-workspaces:latest';
+const FLY_APP_NAME = process.env.WORKSPACE_APP_NAME || 'huffpuff-workspaces';
+const FLY_IMAGE = process.env.WORKSPACE_IMAGE || 'registry.fly.io/huffpuff-workspaces:latest';
 const FLY_REGION = process.env.FLY_REGION || 'sjc';
 
 // Machine config
@@ -169,8 +169,23 @@ async function ensureMachine(userId) {
     return getMachine(userId);
   }
 
-  // Machine exists — check state
+  // Machine exists in DB — check state via API
   const state = await getMachineStatus(record.machine_id);
+
+  // Machine not found in API (destroyed or in wrong app) — recreate
+  if (state === null) {
+    console.log(`Machine ${record.machine_id} not found for user ${userId}, recreating...`);
+    const volume = await createVolume(userId);
+    const machine = await createMachine(userId, volume.id);
+    upsertMachine(userId, {
+      machineId: machine.id,
+      volumeId: volume.id,
+      status: 'started',
+    });
+    await waitForMachine(machine.id, 'started');
+    console.log(`Workspace recreated for user ${userId}: machine=${machine.id}`);
+    return getMachine(userId);
+  }
 
   if (state === 'started') {
     upsertMachine(userId, { status: 'started' });

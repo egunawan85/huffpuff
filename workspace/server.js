@@ -25,11 +25,6 @@ app.use(express.static(path.join(__dirname, 'public')));
 // File browser API
 app.use('/api/files', createFilesRouter(FILES_ROOT));
 
-// Config endpoint
-app.get('/api/config', (req, res) => {
-  res.json({ ttydPort: TTYD_PORT, filesRoot: FILES_ROOT });
-});
-
 // Start ttyd
 function startTtyd() {
   const ttydBin = process.env.TTYD_BIN || 'ttyd';

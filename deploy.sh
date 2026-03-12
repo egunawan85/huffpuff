@@ -1,12 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_DIR="/root/huffpuff"
-GATEWAY_APP="huffpuff-gateway"
-WORKSPACES_APP="huffpuff-workspaces"
-REGION="sjc"
-DOMAIN="thehuffandpuff.com"
-
+APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$APP_DIR"
 
 # Load .env for secrets
@@ -15,6 +10,11 @@ if [ -f .env ]; then
   source .env
   set +a
 fi
+
+GATEWAY_APP="${GATEWAY_APP:-huffpuff-gateway}"
+WORKSPACES_APP="${FLY_APP_NAME:-huffpuff-workspaces}"
+REGION="${FLY_REGION:-sjc}"
+DOMAIN="${DOMAIN:-thehuffandpuff.com}"
 
 # ── 1. Install flyctl if missing ─────────────────────────────────────
 export FLYCTL_INSTALL="$HOME/.fly"
@@ -49,8 +49,7 @@ echo ""
 
 # ── 3. Build and push workspace container image ──────────────────────
 echo "==> Building workspace container image..."
-cd docker
-BUILD_OUTPUT=$(flyctl deploy --app "$WORKSPACES_APP" --dockerfile Dockerfile --build-only --push --remote-only 2>&1)
+BUILD_OUTPUT=$(flyctl deploy --app "$WORKSPACES_APP" --config fly.workspace.toml --build-only --push --remote-only 2>&1)
 echo "$BUILD_OUTPUT"
 # Extract the image reference (with sha256 digest) from the build output
 FLY_WS_IMAGE=$(echo "$BUILD_OUTPUT" | grep -o 'registry.fly.io/'"$WORKSPACES_APP"'[^ ]*@sha256:[a-f0-9]*' | head -1)
@@ -58,7 +57,6 @@ if [ -z "$FLY_WS_IMAGE" ]; then
   echo "WARNING: Could not extract image digest, falling back to :latest tag"
   FLY_WS_IMAGE="registry.fly.io/$WORKSPACES_APP:latest"
 fi
-cd "$APP_DIR"
 echo "    Image: $FLY_WS_IMAGE"
 echo ""
 
@@ -78,8 +76,8 @@ flyctl secrets set --app "$GATEWAY_APP" --stage \
   CALLBACK_URL="${CALLBACK_URL:-https://$DOMAIN/auth/google/callback}" \
   SESSION_SECRET="${SESSION_SECRET:-$(openssl rand -hex 32)}" \
   FLY_API_TOKEN="$FLY_API_TOKEN" \
-  FLY_APP_NAME="$WORKSPACES_APP" \
-  FLY_IMAGE="$FLY_WS_IMAGE" \
+  WORKSPACE_APP_NAME="$WORKSPACES_APP" \
+  WORKSPACE_IMAGE="$FLY_WS_IMAGE" \
   FLY_REGION="$REGION" \
   IDLE_TIMEOUT_MINUTES="${IDLE_TIMEOUT_MINUTES:-30}" \
   COOKIE_SECURE="true"
@@ -89,7 +87,7 @@ echo ""
 
 # ── 5. Deploy gateway ────────────────────────────────────────────────
 echo "==> Deploying gateway..."
-flyctl deploy --app "$GATEWAY_APP" --remote-only
+flyctl deploy --app "$GATEWAY_APP" --config fly.gateway.toml --ha=false --remote-only
 echo ""
 
 # ── 6. Set up custom domain (if not already) ─────────────────────────
@@ -114,7 +112,7 @@ fi
 echo ""
 
 # ── Done ──────────────────────────────────────────────────────────────
-GATEWAY_URL=$(flyctl ips list --app "$GATEWAY_APP" --json 2>/dev/null | grep -o '"address":"[^"]*"' | head -1 | cut -d'"' -f4)
+GATEWAY_URL=$(flyctl ips list --app "$GATEWAY_APP" --json 2>/dev/null | grep -o '"address":"[^"]*"' | head -1 | cut -d'"' -f4 || true)
 
 echo "============================================"
 echo " Huffpuff deployed!"

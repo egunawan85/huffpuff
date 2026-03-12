@@ -12,12 +12,8 @@ fetch('/api/me')
     }
   });
 
-// Load config and set ttyd iframe src
-fetch('/api/config')
-  .then(r => r.json())
-  .then(config => {
-    document.getElementById('terminal').src = location.origin + '/ttyd/';
-  });
+// Set ttyd iframe src
+document.getElementById('terminal').src = location.origin + '/ttyd/';
 
 // Resizable divider
 (function () {
